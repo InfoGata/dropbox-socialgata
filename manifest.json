@@ -1,0 +1,8 @@
+{
+  "id": "f7a3e9c2-4b8d-11ef-9e3a-0242ac130002",
+  "name": "Dropbox Sync for SocialGata",
+  "version": "1.0.0",
+  "description": "Sync your SocialGata favorites to Dropbox cloud storage",
+  "script": "dist/index.js",
+  "options": "dist/options.html"
+}
