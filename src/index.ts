@@ -10,9 +10,24 @@ const DROPBOX_DOWNLOAD_URL = "https://content.dropboxapi.com/2/files/download";
 const TOKEN_KEY = "dropbox_access_token";
 const REFRESH_TOKEN_KEY = "dropbox_refresh_token";
 const CLIENT_ID_KEY = "dropbox_client_id";
+const DEFAULT_CLIENT_ID = "snh5epd0kapddn6";
 
 // State
 let accessToken = localStorage.getItem(TOKEN_KEY) || "";
+let pkceCodeVerifier = "";
+
+/**
+ * Get the parent origin by stripping the pluginId subdomain.
+ * e.g. pluginId.localhost:3000 -> http://localhost:3000
+ *      pluginId.socialgata.com -> https://socialgata.com
+ */
+const getParentOrigin = (): string => {
+  const url = new URL(window.location.origin);
+  const parts = url.hostname.split(".");
+  parts.shift();
+  url.hostname = parts.join(".");
+  return url.origin;
+};
 
 /**
  * Check if user has a valid access token
@@ -44,6 +59,36 @@ const uint8ArrayToBase64 = (bytes: Uint8Array): string => {
     binary += String.fromCharCode(bytes[i]);
   }
   return btoa(binary);
+};
+
+/**
+ * Generate a random PKCE code verifier (43-128 chars, URL-safe)
+ */
+const generateCodeVerifier = (): string => {
+  const array = new Uint8Array(32);
+  crypto.getRandomValues(array);
+  return base64UrlEncode(array);
+};
+
+/**
+ * Derive the PKCE code challenge (S256) from a code verifier
+ */
+const generateCodeChallenge = async (verifier: string): Promise<string> => {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(verifier);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return base64UrlEncode(new Uint8Array(digest));
+};
+
+/**
+ * Base64url encode (no padding, URL-safe)
+ */
+const base64UrlEncode = (bytes: Uint8Array): string => {
+  let binary = "";
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 };
 
 /**
@@ -194,79 +239,86 @@ const syncDownload = async (
 // ============================================
 
 /**
- * Initiate OAuth login flow
+ * Initiate OAuth login flow.
+ * The host app opens a blank popup and passes its name via request.popupName.
+ * Returns the OAuth URL for the host to navigate the popup.
+ * The host will relay the callback URL via onLoginCallback.
  */
-const login = async (request: LoginRequest): Promise<void> => {
-  const clientId = request.apiKey;
+const login = async (request: LoginRequest): Promise<LoginResponse | void> => {
+  const clientId = request.apiKey || localStorage.getItem(CLIENT_ID_KEY);
+  if (clientId) {
+    localStorage.setItem(CLIENT_ID_KEY, clientId);
+  }
 
-  // Store client ID for future use
-  localStorage.setItem(CLIENT_ID_KEY, clientId);
+  if (!request.popupName) {
+    return;
+  }
 
-  // Build OAuth authorization URL
-  const redirectUri = `${window.location.origin}/dropbox-auth-popup.html`;
-  const state = Math.random().toString(36).substring(2, 15);
+  const storedClientId = clientId || localStorage.getItem(CLIENT_ID_KEY) || DEFAULT_CLIENT_ID;
+  const redirectUri = `${getParentOrigin()}/login_popup.html`;
+
+  // Generate PKCE code verifier and challenge
+  pkceCodeVerifier = generateCodeVerifier();
+  const codeChallenge = await generateCodeChallenge(pkceCodeVerifier);
 
   const url = new URL(DROPBOX_AUTH_URL);
-  url.searchParams.append("client_id", clientId);
+  url.searchParams.append("client_id", storedClientId);
   url.searchParams.append("response_type", "code");
   url.searchParams.append("redirect_uri", redirectUri);
-  url.searchParams.append("state", state);
-  url.searchParams.append("token_access_type", "offline"); // Get refresh token
+  url.searchParams.append("token_access_type", "offline");
+  url.searchParams.append("code_challenge_method", "S256");
+  url.searchParams.append("code_challenge", codeChallenge);
 
-  // Open popup for OAuth
-  const popup = window.open(url.toString(), "dropbox-auth", "width=600,height=700");
+  return { url: url.toString() };
+};
 
-  return new Promise((resolve, reject) => {
-    const handleMessage = async (event: MessageEvent) => {
-      // Verify the message is from our popup
-      if (event.source !== popup) return;
+/**
+ * Handle the OAuth callback URL relayed by the host.
+ * Extracts the authorization code and exchanges it for tokens.
+ */
+const loginCallback = async (request: LoginCallbackRequest): Promise<void> => {
+  const callbackUrl = new URL(request.url);
+  const code = callbackUrl.searchParams.get("code");
+  const error = callbackUrl.searchParams.get("error");
 
-      // Check for auth success message
-      if (event.data?.type === "dropbox-auth-success" && event.data?.code) {
-        window.removeEventListener("message", handleMessage);
+  if (error) {
+    application.createNotification({
+      message: `Dropbox auth failed: ${callbackUrl.searchParams.get("error_description") || error}`,
+      type: "error",
+    });
+    return;
+  }
 
-        try {
-          // Exchange authorization code for access token
-          const tokenResponse = await exchangeCodeForToken(
-            event.data.code,
-            clientId,
-            redirectUri
-          );
+  if (!code) {
+    application.createNotification({
+      message: "No authorization code received from Dropbox",
+      type: "error",
+    });
+    return;
+  }
 
-          if (tokenResponse.access_token) {
-            accessToken = tokenResponse.access_token;
-            localStorage.setItem(TOKEN_KEY, tokenResponse.access_token);
+  const clientId = localStorage.getItem(CLIENT_ID_KEY) || DEFAULT_CLIENT_ID;
+  const redirectUri = `${getParentOrigin()}/login_popup.html`;
 
-            if (tokenResponse.refresh_token) {
-              localStorage.setItem(REFRESH_TOKEN_KEY, tokenResponse.refresh_token);
-            }
+  const tokenResponse = await exchangeCodeForToken(code, clientId, redirectUri);
+  console.log("Token response from Dropbox:", tokenResponse);
 
-            application.createNotification({ message: "Successfully connected to Dropbox!" });
-            resolve();
-          } else {
-            reject(new Error("No access token received"));
-          }
-        } catch (error) {
-          reject(error);
-        }
+  if (tokenResponse.access_token) {
+    console.log("Received access token:", tokenResponse.access_token);
+    accessToken = tokenResponse.access_token;
+    localStorage.setItem(TOKEN_KEY, tokenResponse.access_token);
 
-        if (popup && !popup.closed) {
-          popup.close();
-        }
-      }
-    };
+    if (tokenResponse.refresh_token) {
+      localStorage.setItem(REFRESH_TOKEN_KEY, tokenResponse.refresh_token);
+    }
 
-    window.addEventListener("message", handleMessage);
-
-    // Handle popup being closed without completing auth
-    const checkPopupClosed = setInterval(() => {
-      if (popup && popup.closed) {
-        clearInterval(checkPopupClosed);
-        window.removeEventListener("message", handleMessage);
-        // Don't reject - user may have just closed the popup
-      }
-    }, 500);
-  });
+    application.createNotification({ message: "Successfully connected to Dropbox!" });
+  } else {
+    application.createNotification({
+      message: "No access token received from Dropbox",
+      type: "error",
+    });
+  }
 };
 
 /**
@@ -282,6 +334,7 @@ const exchangeCodeForToken = async (
   params.append("grant_type", "authorization_code");
   params.append("client_id", clientId);
   params.append("redirect_uri", redirectUri);
+  params.append("code_verifier", pkceCodeVerifier);
 
   const response = await fetch(DROPBOX_TOKEN_URL, {
     method: "POST",
@@ -331,7 +384,7 @@ const sendMessage = (message: MessageType) => {
  * Get current plugin info for UI
  */
 const getInfo = async () => {
-  const clientId = localStorage.getItem(CLIENT_ID_KEY) || "";
+  const clientId = localStorage.getItem(CLIENT_ID_KEY) || DEFAULT_CLIENT_ID;
   sendMessage({
     type: "info",
     clientId,
@@ -401,6 +454,7 @@ application.onSyncDownload = syncDownload;
 
 // Authentication methods
 application.onLogin = login;
+application.onLoginCallback = loginCallback;
 application.onLogout = logout;
 application.onIsLoggedIn = isLoggedIn;
 
