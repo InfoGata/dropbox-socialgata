@@ -4,5 +4,7 @@
   "version": "1.0.0",
   "description": "Sync your SocialGata favorites to Dropbox cloud storage",
   "script": "dist/index.js",
-  "options": "dist/options.html"
+  "options": "dist/options.html",
+  "updateUrl": "https://cdn.jsdelivr.net/gh/InfoGata/dropbox-socialgata@latest/manifest.json",
+  "homepage": "https://github.com/InfoGata/dropbox-socialgata"
 }
